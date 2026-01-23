@@ -4,5 +4,5 @@ mapping:
   marching_cubes_bound: [[-1.9,3.1],[-1.6,2.6],[-1.1,1.8]]
 data:
   translation: 0
-  input_folder: /mnt/data/dataset/Replica/vmap/office_1/imap/00
+  input_folder: datasets/vmap/office_1/imap/00
   output: output/Replica/office1

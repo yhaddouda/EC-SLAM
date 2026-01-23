@@ -73,6 +73,9 @@ HashGrid:
   posEnc: 'OneBlob'
   n_bins: 16
   hash_size: 16
+  hash: CoherentPrime   # e.g. CoherentPrime, Morton, Prime, ReversedPrime, Rng, BaseConvert
+  morton_sort: False # enable/disable
+  morton_R: 128        # 64..256 good defaults
   voxel_color: 0.08
   voxel_sdf: 0.02
   oneGrid: True

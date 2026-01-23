@@ -6,5 +6,5 @@ data:
   translation: 0
   # /media/fudan-ads/Eleanor2T/Dataset/vmap/room_0/imap/00
   # /home/fudan-ads/Desktop/Research/NICE-SLAM/Datasets/Replica/room0
-  input_folder: /mnt/data/dataset/Replica/vmap/office_0/imap/00
+  input_folder: datasets/vmap/office_0/imap/00
   output: output/Replica/office0

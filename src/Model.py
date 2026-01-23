@@ -4,6 +4,18 @@ import numpy as np
 import torch.nn as nn
 import tinycudann as tcnn
 
+# Morton code imports
+from .fast_morton import morton3d_keys_cuda
+
+
+@torch.no_grad()
+def morton_permutation_from_points01(pts01: torch.Tensor, R: int = 128) -> torch.Tensor:
+    # pts01: [N,3], float32, CUDA
+    with torch.cuda.nvtx.range("morton_keys"):
+        keys = morton3d_keys_cuda(pts01, R)          # int32 keys on GPU
+    with torch.cuda.nvtx.range("argsort"):
+        perm = torch.argsort(keys, stable=False)     # fast radix on int32
+    return perm.to(torch.long)
 
 
 class ColorNet(nn.Module):
@@ -129,11 +141,11 @@ class HashGrid(nn.Module):
 
         # Coordinate encoding
         self.embedpos_fn, self.input_ch_pos = get_encoder(config['HashGrid']['posEnc'],
-                                                          n_bins=self.config['HashGrid']['n_bins'])
+                                                          n_bins=self.config['HashGrid']['n_bins'], hash=self.config['HashGrid'].get('hash', 'CoherentPrime'))
         # Sparse parametric encoding (SDF)
         self.embed_fn, self.input_ch = get_encoder('HashGrid', log2_hashmap_size=config['HashGrid']['hash_size'],
-                                                   desired_resolution=self.resolution_sdf)
-
+                                                   desired_resolution=self.resolution_sdf, hash=self.config['HashGrid'].get('hash', 'CoherentPrime'))
+        print('Hash function type: ', self.config['HashGrid'].get('hash', 'CoherentPrime'))
         self.color_net = ColorNet(config,
                                   input_ch=self.input_ch_pos,
                                   geo_feat_dim=config['HashGrid']['geo_feat_dim'],
@@ -144,6 +156,7 @@ class HashGrid(nn.Module):
                               geo_feat_dim=config['HashGrid']['geo_feat_dim'],
                               hidden_dim=config['HashGrid']['hidden_dim'],
                               num_layers=config['HashGrid']['num_layers'])
+        print("Morton sort is:", self.config['HashGrid'].get('morton_sort', False))
 
     def get_resolution(self):
         '''
@@ -173,16 +186,46 @@ class HashGrid(nn.Module):
         embedded = self.embed_fn(inputs_flat)
         return embedded
 
+    # [Model.py] - Inside class HashGrid
     def forward(self, points, onlySdf=False):
-        # print(embed.shape, embed_pos.shape)
+        # 1. Normalize points to [0, 1]
         inputs_flat = (points - self.bounding_box[:, 0]) / (self.bounding_box[:, 1] - self.bounding_box[:, 0])
+        
+        # --- MORTON SORT START ---
+        # Check config to see if sorting is enabled (e.g. config['HashGrid']['morton_sort'])
+        do_morton = self.config['HashGrid'].get('morton_sort', False)
+        perm = None
+
+        if do_morton:
+            # You must have morton_permutation_from_points01 available here
+            # R is usually 128 or defined in config
+            R_val = self.config['HashGrid'].get('morton_R', 128)
+            perm = morton_permutation_from_points01(inputs_flat, R=R_val)
+            
+            # Reorder the normalized inputs
+            inputs_flat = inputs_flat[perm]
+        # --- MORTON SORT END ---
+
+        # 2. Run Encodings (on sorted data if enabled)
         embed = self.embed_fn(inputs_flat)
         embed_pos = self.embedpos_fn(inputs_flat)
 
+        # 3. Run SDF Network
         h = self.sdf_net(torch.cat([embed, embed_pos], dim=-1), return_geo=True)
         sdf, geo_feat = h[..., :1], h[..., 1:]
+        
         if onlySdf:
-            return sdf
+            # --- UNSORT IF RETURNING EARLY ---
+            if do_morton and perm is not None:
+                # We need to invert the permutation to restore original order
+                # Scatter back: out[perm] = sorted_out
+                sdf_unsorted = torch.empty_like(sdf)
+                sdf_unsorted[perm] = sdf
+                return sdf_unsorted
+            else:
+                return sdf
+
+        # 4. Run Color Network
         if self.embed2color:
             rgb = self.color_net(torch.cat([embed_pos, geo_feat], dim=-1))
         else:
@@ -191,7 +234,17 @@ class HashGrid(nn.Module):
         if self.dosig:
             rgb = torch.sigmoid(rgb)
 
-        return torch.cat([rgb, sdf], -1)
+        output = torch.cat([rgb, sdf], -1)
+
+        # --- MORTON UNSORT START ---
+        if do_morton and perm is not None:
+            # Restore original order
+            output_unsorted = torch.empty_like(output)
+            output_unsorted[perm] = output
+            return output_unsorted
+        # --- MORTON UNSORT END ---
+
+        return output
 
 
 class Model(nn.Module):
@@ -432,7 +485,7 @@ def batchify(fn, chunk=1024 * 64):
 
 
 # same as Co-slam
-def get_encoder(encoding, input_dim=3,
+def get_encoder(encoding, hash: str = "CoherentPrime", input_dim=3,
                 n_bins=16, n_levels=16, level_dim=2,
                 base_resolution=16, log2_hashmap_size=19,
                 desired_resolution=512):
@@ -442,6 +495,7 @@ def get_encoder(encoding, input_dim=3,
         embed = tcnn.Encoding(
             n_input_dims=input_dim,
             encoding_config={
+                "hash": hash,
                 "otype": 'HashGrid',
                 "n_levels": n_levels,
                 "n_features_per_level": level_dim,
