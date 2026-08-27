@@ -80,9 +80,16 @@ class Replica(Dataset):
         self.depth_scale = 1 / cfg["cam"]['png_depth_scale']
         self.depth_transform = transforms.Compose(
             [DepthScale(self.depth_scale)])
+        self.n_img = len(os.listdir(os.path.join(self.root_dir, "depth")))
+        max_frames = cfg.get("timing", {}).get("max_frames")
+        if max_frames is not None:
+            max_frames = int(max_frames)
+            if max_frames <= 0:
+                raise ValueError("timing.max_frames must be positive or null")
+            self.n_img = min(self.n_img, max_frames)
 
     def __len__(self):
-        return len(os.listdir(os.path.join(self.root_dir, "depth")))
+        return self.n_img
 
     def __getitem__(self, idx):
         rgb_file = os.path.join(self.root_dir, "rgb", "rgb_" + str(idx) + ".png")

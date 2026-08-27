@@ -6,14 +6,15 @@ import tinycudann as tcnn
 
 # Morton code imports
 from .fast_morton import morton3d_keys_cuda
+from .profiling import nvtx_range
 
 
 @torch.no_grad()
 def morton_permutation_from_points01(pts01: torch.Tensor, R: int = 128) -> torch.Tensor:
     # pts01: [N,3], float32, CUDA
-    with torch.cuda.nvtx.range("morton_keys"):
+    with nvtx_range("morton_keys"):
         keys = morton3d_keys_cuda(pts01, R)          # int32 keys on GPU
-    with torch.cuda.nvtx.range("argsort"):
+    with nvtx_range("argsort"):
         perm = torch.argsort(keys, stable=False)     # fast radix on int32
     return perm.to(torch.long)
 
@@ -140,22 +141,37 @@ class HashGrid(nn.Module):
             self.beta = 10
 
         # Coordinate encoding
-        self.embedpos_fn, self.input_ch_pos = get_encoder(config['HashGrid']['posEnc'],
-                                                          n_bins=self.config['HashGrid']['n_bins'], hash=self.config['HashGrid'].get('hash', 'CoherentPrime'))
+        with nvtx_range("coord_encoder"):
+            self.embedpos_fn, self.input_ch_pos = get_encoder(
+                config['HashGrid']['posEnc'],
+                n_bins=self.config['HashGrid']['n_bins'],
+                hash=self.config['HashGrid'].get('hash', 'CoherentPrime'),
+            )
         # Sparse parametric encoding (SDF)
-        self.embed_fn, self.input_ch = get_encoder('HashGrid', log2_hashmap_size=config['HashGrid']['hash_size'],
-                                                   desired_resolution=self.resolution_sdf, hash=self.config['HashGrid'].get('hash', 'CoherentPrime'))
+        with nvtx_range("parametric_encoder_sdf"):
+            self.embed_fn, self.input_ch = get_encoder(
+                'HashGrid',
+                log2_hashmap_size=config['HashGrid']['hash_size'],
+                desired_resolution=self.resolution_sdf,
+                hash=self.config['HashGrid'].get('hash', 'CoherentPrime'),
+            )
         print('Hash function type: ', self.config['HashGrid'].get('hash', 'CoherentPrime'))
-        self.color_net = ColorNet(config,
-                                  input_ch=self.input_ch_pos,
-                                  geo_feat_dim=config['HashGrid']['geo_feat_dim'],
-                                  hidden_dim_color=config['HashGrid']['hidden_dim_color'],
-                                  num_layers_color=config['HashGrid']['num_layers_color'])
-        self.sdf_net = SDFNet(config,
-                              input_ch=self.input_ch + self.input_ch_pos,
-                              geo_feat_dim=config['HashGrid']['geo_feat_dim'],
-                              hidden_dim=config['HashGrid']['hidden_dim'],
-                              num_layers=config['HashGrid']['num_layers'])
+        with nvtx_range("Color_Net"):
+            self.color_net = ColorNet(
+                config,
+                input_ch=self.input_ch_pos,
+                geo_feat_dim=config['HashGrid']['geo_feat_dim'],
+                hidden_dim_color=config['HashGrid']['hidden_dim_color'],
+                num_layers_color=config['HashGrid']['num_layers_color'],
+            )
+        with nvtx_range("SDF_Net"):
+            self.sdf_net = SDFNet(
+                config,
+                input_ch=self.input_ch + self.input_ch_pos,
+                geo_feat_dim=config['HashGrid']['geo_feat_dim'],
+                hidden_dim=config['HashGrid']['hidden_dim'],
+                num_layers=config['HashGrid']['num_layers'],
+            )
         print("Morton sort is:", self.config['HashGrid'].get('morton_sort', False))
 
     def get_resolution(self):
@@ -186,63 +202,58 @@ class HashGrid(nn.Module):
         embedded = self.embed_fn(inputs_flat)
         return embedded
 
-    # [Model.py] - Inside class HashGrid
     def forward(self, points, onlySdf=False):
-        # 1. Normalize points to [0, 1]
-        inputs_flat = (points - self.bounding_box[:, 0]) / (self.bounding_box[:, 1] - self.bounding_box[:, 0])
-        
-        # --- MORTON SORT START ---
-        # Check config to see if sorting is enabled (e.g. config['HashGrid']['morton_sort'])
+        # Normalize points to the coordinate system expected by tiny-cuda-nn.
+        with nvtx_range("normalize_points"):
+            inputs_flat = (points - self.bounding_box[:, 0]) / (
+                self.bounding_box[:, 1] - self.bounding_box[:, 0]
+            )
+
         do_morton = self.config['HashGrid'].get('morton_sort', False)
         perm = None
-
         if do_morton:
-            # You must have morton_permutation_from_points01 available here
-            # R is usually 128 or defined in config
-            R_val = self.config['HashGrid'].get('morton_R', 128)
-            perm = morton_permutation_from_points01(inputs_flat, R=R_val)
-            
-            # Reorder the normalized inputs
-            inputs_flat = inputs_flat[perm]
-        # --- MORTON SORT END ---
+            with nvtx_range("morton_permutation"):
+                R_val = self.config['HashGrid'].get('morton_R', 128)
+                perm = morton_permutation_from_points01(inputs_flat, R=R_val)
+                with nvtx_range("reorder_queries"):
+                    inputs_flat = inputs_flat[perm]
 
-        # 2. Run Encodings (on sorted data if enabled)
-        embed = self.embed_fn(inputs_flat)
-        embed_pos = self.embedpos_fn(inputs_flat)
+        # Figure 1 network decomposition: hash-grid, one-blob, then MLPs.
+        with nvtx_range("TCNN_hashgrid_encoding"):
+            embed = self.embed_fn(inputs_flat)
+        with nvtx_range("TCNN_oneblob_encoding"):
+            embed_pos = self.embedpos_fn(inputs_flat)
 
-        # 3. Run SDF Network
-        h = self.sdf_net(torch.cat([embed, embed_pos], dim=-1), return_geo=True)
-        sdf, geo_feat = h[..., :1], h[..., 1:]
-        
-        if onlySdf:
-            # --- UNSORT IF RETURNING EARLY ---
-            if do_morton and perm is not None:
-                # We need to invert the permutation to restore original order
-                # Scatter back: out[perm] = sorted_out
-                sdf_unsorted = torch.empty_like(sdf)
-                sdf_unsorted[perm] = sdf
-                return sdf_unsorted
-            else:
+        with nvtx_range("MLP_decoders"):
+            with nvtx_range("SDF_Net"):
+                h = self.sdf_net(torch.cat([embed, embed_pos], dim=-1), return_geo=True)
+            with nvtx_range("split_sdf_features"):
+                sdf, geo_feat = h[..., :1], h[..., 1:]
+
+            if onlySdf:
+                if perm is not None:
+                    with nvtx_range("unpermute"):
+                        sdf_unsorted = torch.empty_like(sdf)
+                        sdf_unsorted[perm] = sdf
+                    return sdf_unsorted
                 return sdf
 
-        # 4. Run Color Network
-        if self.embed2color:
-            rgb = self.color_net(torch.cat([embed_pos, geo_feat], dim=-1))
-        else:
-            rgb = self.color_net(torch.cat([embed_pos, embed], dim=-1))
+            with nvtx_range("Color_Net"):
+                if self.embed2color:
+                    rgb = self.color_net(torch.cat([embed_pos, geo_feat], dim=-1))
+                else:
+                    rgb = self.color_net(torch.cat([embed_pos, embed], dim=-1))
 
-        if self.dosig:
-            rgb = torch.sigmoid(rgb)
+            with nvtx_range("prepare_network_output"):
+                if self.dosig:
+                    rgb = torch.sigmoid(rgb)
+                output = torch.cat([rgb, sdf], -1)
 
-        output = torch.cat([rgb, sdf], -1)
-
-        # --- MORTON UNSORT START ---
-        if do_morton and perm is not None:
-            # Restore original order
-            output_unsorted = torch.empty_like(output)
-            output_unsorted[perm] = output
+        if perm is not None:
+            with nvtx_range("unpermute"):
+                output_unsorted = torch.empty_like(output)
+                output_unsorted[perm] = output
             return output_unsorted
-        # --- MORTON UNSORT END ---
 
         return output
 
@@ -268,23 +279,26 @@ class Model(nn.Module):
         return weights
 
     def raw2outputs(self, raw, z_vals):
-
-        rgb = raw[..., :3]  # [N_rays, N_samples, 3]
-        weights = self.sdf2weights(raw[..., 3])
-        rgb_map = torch.sum(weights[..., None] * rgb, -2)
-        depth_map = torch.sum(weights * z_vals, -1)
+        with nvtx_range("prepare_volume_weights"):
+            rgb = raw[..., :3]  # [N_rays, N_samples, 3]
+            weights = self.sdf2weights(raw[..., 3])
+        with nvtx_range("integrate_color_depth"):
+            rgb_map = torch.sum(weights[..., None] * rgb, -2)
+            depth_map = torch.sum(weights * z_vals, -1)
 
         return rgb_map, depth_map, raw[..., -1], z_vals
 
     def query_color_sdf(self, query_points):
-        inputs_flat = torch.reshape(query_points, [-1, query_points.shape[-1]])
+        with nvtx_range("reshape_inputs"):
+            inputs_flat = torch.reshape(query_points, [-1, query_points.shape[-1]])
         return self.decoder(inputs_flat)
 
     def query_color(self, query_points):
         return self.query_color_sdf(query_points)[..., :3]
 
     def query_sdf(self, query_points):
-        inputs_flat = torch.reshape(query_points, [-1, query_points.shape[-1]])
+        with nvtx_range("reshape_inputs"):
+            inputs_flat = torch.reshape(query_points, [-1, query_points.shape[-1]])
         return self.decoder.forward(inputs_flat, onlySdf=True)
 
     def render_rays(self, rays_o, rays_d, target_d):
@@ -293,98 +307,170 @@ class Model(nn.Module):
         n_importance = self.config['sampleAndLoss']['n_importance']
 
         n_rays = rays_o.shape[0]
-        gt_depth = target_d.squeeze(1)
+        with nvtx_range("depth_sampling"):
+            gt_depth = target_d.squeeze(1)
+            z_vals = torch.empty([n_rays, n_stratified + n_importance], device=self.device)
+            near = 0.0
+            t_vals_uni = torch.linspace(0., 1., steps=n_stratified, device=self.device)
+            t_vals_surface = torch.linspace(0., 1., steps=n_importance, device=self.device)
 
-        z_vals = torch.empty([n_rays, n_stratified + n_importance], device=self.device)
-        near = 0.0
-        t_vals_uni = torch.linspace(0., 1., steps=n_stratified, device=self.device)
-        t_vals_surface = torch.linspace(0., 1., steps=n_importance, device=self.device)
+            # RGB-D rays: combine free-space and surface-centred TSDF samples.
+            with nvtx_range("depth_guided_sampling"):
+                gt_depth = gt_depth.reshape(-1, 1)
+                gt_mask = (gt_depth > 0).squeeze()
+                gt_nonezero = gt_depth[gt_mask]
 
-        ### pixels with gt depth:
-        gt_depth = gt_depth.reshape(-1, 1)
-        gt_mask = (gt_depth > 0).squeeze()
-        gt_nonezero = gt_depth[gt_mask]
+                gt_depth_surface = gt_nonezero.expand(-1, n_importance)
+                z_vals_surface = gt_depth_surface - (1.5 * truncation) + (
+                    3 * truncation * t_vals_surface
+                )
+                gt_depth_free = gt_nonezero.expand(-1, n_stratified)
+                z_vals_free = near + 1.2 * gt_depth_free * t_vals_uni
+                z_vals_nonzero, _ = torch.sort(
+                    torch.cat([z_vals_free, z_vals_surface], dim=-1), dim=-1
+                )
+                with nvtx_range("perturb_depths"):
+                    z_vals_nonzero = self.perturbation(z_vals_nonzero)
+                z_vals[gt_mask] = z_vals_nonzero
 
-        ## Sampling points around the gt depth (surface)
-        gt_depth_surface = gt_nonezero.expand(-1, n_importance)
-        z_vals_surface = gt_depth_surface - (1.5 * truncation) + (3 * truncation * t_vals_surface)
+            # Rays without depth need an extra coarse network pass to build a PDF.
+            if not gt_mask.all():
+                with nvtx_range("missing_depth_importance_sampling"):
+                    with torch.no_grad():
+                        rays_o_uni = rays_o[~gt_mask].detach()
+                        rays_d_uni = rays_d[~gt_mask].detach()
 
-        gt_depth_free = gt_nonezero.expand(-1, n_stratified)
-        z_vals_free = near + 1.2 * gt_depth_free * t_vals_uni
+                        with nvtx_range("ray_box_intersection"):
+                            det_rays_o = rays_o_uni.unsqueeze(-1)  # (N, 3, 1)
+                            det_rays_d = rays_d_uni.unsqueeze(-1)  # (N, 3, 1)
+                            t = (self.bounding_box.unsqueeze(0) - det_rays_o) / det_rays_d
+                            far_bb, _ = torch.min(torch.max(t, dim=2)[0], dim=1)
+                            far_bb = far_bb.unsqueeze(-1)
+                            far_bb += 0.01
 
-        z_vals_nonzero, _ = torch.sort(torch.cat([z_vals_free, z_vals_surface], dim=-1), dim=-1)
-        z_vals_nonzero = self.perturbation(z_vals_nonzero)
-        z_vals[gt_mask] = z_vals_nonzero
+                        with nvtx_range("coarse_depth_sampling"):
+                            z_vals_uni = near * (1. - t_vals_uni) + far_bb * t_vals_uni
+                            z_vals_uni = self.perturbation(z_vals_uni)
+                            pts_uni = rays_o_uni.unsqueeze(1) + rays_d_uni.unsqueeze(1) * (
+                                z_vals_uni.unsqueeze(-1)
+                            )
 
-        ### pixels without gt depth (importance sampling):
-        if not gt_mask.all():
-            with torch.no_grad():
-                rays_o_uni = rays_o[~gt_mask].detach()
-                rays_d_uni = rays_d[~gt_mask].detach()
-                det_rays_o = rays_o_uni.unsqueeze(-1)  # (N, 3, 1)
-                det_rays_d = rays_d_uni.unsqueeze(-1)  # (N, 3, 1)
-                t = (self.bounding_box.unsqueeze(0) - det_rays_o) / det_rays_d  # (N, 3, 2)
-                far_bb, _ = torch.min(torch.max(t, dim=2)[0], dim=1)
-                far_bb = far_bb.unsqueeze(-1)
-                far_bb += 0.01
+                        with nvtx_range("coarse_network_evaluation"):
+                            inputs_flat = torch.reshape(
+                                pts_uni.clone(), [-1, pts_uni.clone().shape[-1]]
+                            )
+                            sdf_uni = self.decoder.forward(inputs_flat)[:, 3]
+                            sdf_uni = sdf_uni.reshape(*pts_uni.shape[0:2])
 
-                z_vals_uni = near * (1. - t_vals_uni) + far_bb * t_vals_uni
-                z_vals_uni = self.perturbation(z_vals_uni)
-                pts_uni = rays_o_uni.unsqueeze(1) + rays_d_uni.unsqueeze(1) * z_vals_uni.unsqueeze(
-                    -1)  # [n_rays, n_stratified, 3]
+                        with nvtx_range("coarse_volume_weights"):
+                            alpha_uni = 1. - torch.exp(
+                                -self.decoder.beta
+                                * torch.sigmoid(-sdf_uni * self.decoder.beta)
+                            )
+                            weights_uni = alpha_uni * torch.cumprod(
+                                torch.cat(
+                                    [
+                                        torch.ones(
+                                            (alpha_uni.shape[0], 1), device=self.device
+                                        ),
+                                        (1. - alpha_uni + 1e-10),
+                                    ],
+                                    -1,
+                                ),
+                                -1,
+                            )[:, :-1]
 
-                inputs_flat = torch.reshape(pts_uni.clone(), [-1, pts_uni.clone().shape[-1]])
-                sdf_uni = self.decoder.forward(inputs_flat)[:, 3]
-                sdf_uni = sdf_uni.reshape(*pts_uni.shape[0:2])
-                alpha_uni = 1. - torch.exp(
-                    -self.decoder.beta * torch.sigmoid(-sdf_uni * self.decoder.beta))
-                weights_uni = alpha_uni * torch.cumprod(
-                    torch.cat([torch.ones((alpha_uni.shape[0], 1), device=self.device)
-                                  , (1. - alpha_uni + 1e-10)], -1), -1)[:, :-1]
+                        with nvtx_range("sample_pdf"):
+                            z_vals_uni_mid = .5 * (
+                                z_vals_uni[..., 1:] + z_vals_uni[..., :-1]
+                            )
+                            z_samples_uni = sample_pdf(
+                                z_vals_uni_mid,
+                                weights_uni[..., 1:-1],
+                                n_importance,
+                                det=False,
+                                device=self.device,
+                            )
+                            z_vals_uni, _ = torch.sort(
+                                torch.cat([z_vals_uni, z_samples_uni], -1), -1
+                            )
+                            z_vals[~gt_mask] = z_vals_uni
 
-                z_vals_uni_mid = .5 * (z_vals_uni[..., 1:] + z_vals_uni[..., :-1])
-                z_samples_uni = sample_pdf(z_vals_uni_mid, weights_uni[..., 1:-1], n_importance, det=False,
-                                           device=self.device)
-                z_vals_uni, ind = torch.sort(torch.cat([z_vals_uni, z_samples_uni], -1), -1)
-                z_vals[~gt_mask] = z_vals_uni
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-              z_vals[..., :, None]  # [n_rays, n_stratified+n_importance, 3]
-        inputs_flat = torch.reshape(pts, [-1, pts.shape[-1]])
-        outputs_flat = batchify(self.query_color_sdf, None)(inputs_flat)
-        raw = torch.reshape(outputs_flat, list(pts.shape[:-1]) + [outputs_flat.shape[-1]])
-        rgb_map, depth_map, sdf, z_vals = self.raw2outputs(raw, z_vals)
+        with nvtx_range("compute_points"):
+            pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
+            inputs_flat = torch.reshape(pts, [-1, pts.shape[-1]])
+
+        with nvtx_range("run_network"):
+            outputs_flat = batchify(self.query_color_sdf, None)(inputs_flat)
+            raw = torch.reshape(
+                outputs_flat, list(pts.shape[:-1]) + [outputs_flat.shape[-1]]
+            )
+
+        with nvtx_range("volume_rendering"):
+            rgb_map, depth_map, sdf, z_vals = self.raw2outputs(raw, z_vals)
         return rgb_map, depth_map, sdf, z_vals
 
     def forward(self, rays_o, rays_d, target_rgb, target_d, tracker=False, smooth=False):
-        if not hasattr(self, "fs_weight_t"):
-            self.fs_weight_t = self.config["tracking"]["fs_weight"]
-            self.center_weight_t = self.config["tracking"]["center_weight"]
-            self.tail_weight_t = self.config["tracking"]["tail_weight"]
-            self.depth_weight_t = self.config["tracking"]["depth_weight"]
-            self.color_weight_t = self.config["tracking"]["color_weight"]
+        with nvtx_range("initialize_loss_weights"):
+            if not hasattr(self, "fs_weight_t"):
+                self.fs_weight_t = self.config["tracking"]["fs_weight"]
+                self.center_weight_t = self.config["tracking"]["center_weight"]
+                self.tail_weight_t = self.config["tracking"]["tail_weight"]
+                self.depth_weight_t = self.config["tracking"]["depth_weight"]
+                self.color_weight_t = self.config["tracking"]["color_weight"]
 
-            self.fs_weight_m = self.config["mapping"]["fs_weight"]
-            self.center_weight_m = self.config["mapping"]["center_weight"]
-            self.tail_weight_m = self.config["mapping"]["tail_weight"]
-            self.depth_weight_m = self.config["mapping"]["depth_weight"]
-            self.color_weight_m = self.config["mapping"]["color_weight"]
+                self.fs_weight_m = self.config["mapping"]["fs_weight"]
+                self.center_weight_m = self.config["mapping"]["center_weight"]
+                self.tail_weight_m = self.config["mapping"]["tail_weight"]
+                self.depth_weight_m = self.config["mapping"]["depth_weight"]
+                self.color_weight_m = self.config["mapping"]["color_weight"]
 
-            self.fs_m = self.config["sampleAndLoss"]["fs_weight"]
-            self.sdf_m = self.config["sampleAndLoss"]["sdf_weight"]
-            self.rgb_m = self.config["sampleAndLoss"]["rgb_weight"]
-            self.depth_m = self.config["sampleAndLoss"]["depth_weight"]
+                self.fs_m = self.config["sampleAndLoss"]["fs_weight"]
+                self.sdf_m = self.config["sampleAndLoss"]["sdf_weight"]
+                self.rgb_m = self.config["sampleAndLoss"]["rgb_weight"]
+                self.depth_m = self.config["sampleAndLoss"]["depth_weight"]
 
-        rgb_map, depth_map, sdf, z_vals = self.render_rays(rays_o, rays_d, target_d)
-        depth_mask = (target_d > 0).squeeze(1)
-        fs_loss, center_loss, tail_loss = self.sdf_losses(sdf, z_vals,
-                                                          target_d, depth_mask)
-        depthLoss = torch.square(target_d.squeeze()[depth_mask] - depth_map[depth_mask]).mean()
-        if tracker:
-            colorLoss = 0
-            loss = self.fs_weight_t * fs_loss + self.center_weight_t * center_loss + self.tail_weight_t * tail_loss + self.depth_weight_t * depthLoss + self.color_weight_t * colorLoss
-        else:
-            colorLoss = torch.square(target_rgb - rgb_map).mean()
-            loss = self.fs_weight_m * fs_loss + self.center_weight_m * center_loss + self.tail_weight_m * tail_loss + self.depth_weight_m * depthLoss + self.color_weight_m * colorLoss
+        # Figure 1 forward decomposition: rendering followed by SDF/render loss.
+        with nvtx_range("render_rays"):
+            rgb_map, depth_map, sdf, z_vals = self.render_rays(
+                rays_o, rays_d, target_d
+            )
+
+        with nvtx_range("sdf_and_render_loss"):
+            with nvtx_range("prepare_loss_masks"):
+                depth_mask = (target_d > 0).squeeze(1)
+
+            with nvtx_range("compute_sdf_losses"):
+                fs_loss, center_loss, tail_loss = self.sdf_losses(
+                    sdf, z_vals, target_d, depth_mask
+                )
+
+            with nvtx_range("compute_render_losses"):
+                depthLoss = torch.square(
+                    target_d.squeeze()[depth_mask] - depth_map[depth_mask]
+                ).mean()
+                if tracker:
+                    colorLoss = 0
+                else:
+                    colorLoss = torch.square(target_rgb - rgb_map).mean()
+
+            with nvtx_range("combine_losses"):
+                if tracker:
+                    loss = (
+                        self.fs_weight_t * fs_loss
+                        + self.center_weight_t * center_loss
+                        + self.tail_weight_t * tail_loss
+                        + self.depth_weight_t * depthLoss
+                        + self.color_weight_t * colorLoss
+                    )
+                else:
+                    loss = (
+                        self.fs_weight_m * fs_loss
+                        + self.center_weight_m * center_loss
+                        + self.tail_weight_m * tail_loss
+                        + self.depth_weight_m * depthLoss
+                        + self.color_weight_m * colorLoss
+                    )
         return loss
 
     def perturbation(self, z_vals):

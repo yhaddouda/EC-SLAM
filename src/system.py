@@ -8,6 +8,7 @@ from src.Mapper import Mapper
 from src.Tracker import Tracker
 from src.Logger import Logger
 from src.Datasets import get_dataset
+from src.profiling import IterationBreakdownCudaTimer
 
 
 class EC_SLAM():
@@ -42,6 +43,16 @@ class EC_SLAM():
         self.mapping_idx = torch.zeros((1)).int()
         self.mapping_cnt = torch.zeros((1)).int()
         self.vis_dict = {}
+        timing_cfg = cfg.get('timing', {})
+        self.iteration_timer = IterationBreakdownCudaTimer(
+            enabled=timing_cfg.get('mode', 'none') == 'iteration_breakdown',
+            output_csv=timing_cfg.get(
+                'iteration_output_csv',
+                './profiling/iteration_breakdown.csv',
+            ),
+            warmup_frames=timing_cfg.get('warmup_frames', 0),
+            device=cfg.get('device'),
+        )
         self.logger = Logger(self)
         self.mapper = Mapper(cfg, args, self)
         self.tracker = Tracker(cfg, args, self)
@@ -98,6 +109,7 @@ class EC_SLAM():
                 # p = mp.Process(target=self.mapping, args=(rank,))
         for p in processes:
             p.join()
+        self.iteration_timer.flush()
 
 
 if __name__ == '__main__':
